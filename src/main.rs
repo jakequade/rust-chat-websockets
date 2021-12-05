@@ -12,6 +12,7 @@ use std::error::Error;
 use std::net::SocketAddr;
 
 mod client;
+mod frame;
 mod server;
 
 use crate::server::WebSocketServer;

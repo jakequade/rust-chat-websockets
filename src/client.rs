@@ -13,6 +13,8 @@ use std::collections::HashMap;
 
 use std::rc::Rc;
 
+use crate::frame::WebSocketFrame;
+
 pub struct HttpParser {
     current_key: Option<String>,
     headers: Rc<RefCell<HashMap<String, String>>>,
@@ -40,15 +42,14 @@ impl ParserHandler for HttpParser {
 
 pub struct WebSocketClient {
     pub socket: TcpStream,
-    pub http_parser: Parser<HttpParser>,
     pub headers: Rc<RefCell<HashMap<String, String>>>,
     pub interest: EventSet,
     pub state: ClientState,
+    outgoing: Vec<WebSocketFrame>,
 }
 
-#[derive(PartialEq)]
 pub enum ClientState {
-    AwaitingHandshake,
+    AwaitingHandshake(RefCell<Parser<HttpParser>>),
     HandshakeResponse,
     Connected,
 }
@@ -66,7 +67,7 @@ fn gen_key(key: &String) -> String {
 }
 
 impl WebSocketClient {
-    pub fn read(&mut self) {
+    pub fn read_handshake(&mut self) {
         loop {
             let mut buf = [0; 2048];
             match self.socket.try_read(&mut buf) {
@@ -79,10 +80,17 @@ impl WebSocketClient {
                     break;
                 }
                 Ok(Some(len)) => {
-                    self.http_parser.parse(&buf[0..len]);
+                    let is_upgrade =
+                        if let ClientState::AwaitingHandshake(ref parser_state) = self.state {
+                            let mut parser = parser_state.borrow_mut();
+                            parser.parse(&buf);
+                            parser.is_upgrade()
+                        } else {
+                            false
+                        };
 
                     // Handshake was successful
-                    if self.http_parser.is_upgrade() {
+                    if is_upgrade {
                         self.state = ClientState::HandshakeResponse;
 
                         self.interest.remove(EventSet::readable());
@@ -95,6 +103,26 @@ impl WebSocketClient {
         }
     }
 
+    pub fn read(&mut self) {
+        let frame = WebSocketFrame::read(&mut self.socket);
+        match frame {
+            Ok(frame) => {
+                println!("{:?}", frame);
+
+                // Add a reply frame to the queue:
+                let reply_frame = WebSocketFrame::from("Hi there!");
+                self.outgoing.push(reply_frame);
+
+                // Switch the event subscription to the write mode if the queue is not empty:
+                if (self.outgoing.len() > 0) {
+                    self.interest.remove(EventSet::readable());
+                    self.interest.insert(EventSet::writable());
+                }
+            }
+            Err(e) => println!("error while reading frame: {}", e),
+        }
+    }
+
     pub fn new(socket: TcpStream) -> WebSocketClient {
         let headers = Rc::new(RefCell::new(HashMap::new()));
 
@@ -102,17 +130,39 @@ impl WebSocketClient {
             socket,
             // reads headers contents
             headers: headers.clone(),
-            http_parser: Parser::request(HttpParser {
-                current_key: None,
-                // writes new headers
-                headers: headers.clone(),
-            }),
             interest: EventSet::readable(),
-            state: ClientState::AwaitingHandshake,
+            state: ClientState::AwaitingHandshake(RefCell::new(Parser::request(HttpParser {
+                current_key: None,
+                headers: headers.clone(),
+            }))),
+            outgoing: vec![],
         }
     }
 
     pub fn write(&mut self) {
+        match self.state {
+            ClientState::AwaitingHandshake(_) => {
+                self.write_handshake();
+            }
+            ClientState::Connected => {
+                println!("sending {} frames", self.outgoing.len());
+
+                for frame in self.outgoing.iter() {
+                    if let Err(e) = frame.write(&mut self.socket) {
+                        println!("error on write: {}", e);
+                    }
+                }
+
+                self.outgoing.clear();
+
+                self.interest.remove(EventSet::writable());
+                self.interest.insert(EventSet::readable());
+            }
+            _ => {}
+        }
+    }
+
+    pub fn write_handshake(&mut self) {
         let headers = self.headers.borrow();
         let response_key = gen_key(&headers.get("Sec-WebSocket-Key").unwrap());
 
