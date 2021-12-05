@@ -1,0 +1,12 @@
+[package]
+name = "chat"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+http-muncher = "0.2.0"
+mio = "0.5"
+rustc-serialize = "0.3.15"
+sha1 = "0.1.1"
